@@ -5,21 +5,26 @@ using System.Collections.Generic;
 using System.IO.Pipelines;
 using System.Linq;
 using System.Net.Sockets;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit.Internal;
 using Xunit.Sdk;
+using Xunit.v3;
 
 namespace Xunit.Runner.v3;
 
 /// <summary>
 /// Provides a line-oriented read/write wrapper over top of a TCP socket.
+/// on both sides of the v3 TCP-based reporter system (<see cref="T:Xunit.Runner.v3.TcpExecutionEngine"/> and
+/// <see cref="TcpRunnerEngine"/>).
 /// </summary>
 public class BufferedTcpClient : IAsyncDisposable
 {
+	readonly string clientID;
+	readonly _IMessageSink? diagnosticMessageSink;
 	bool disposed = false;
 	readonly DisposalTracker disposalTracker = new();
-	Exception? fault;
 	readonly TaskCompletionSource<int> finishedSource = new();
 	readonly Action<ReadOnlyMemory<byte>> receiveHandler;
 	readonly Socket socket;
@@ -30,28 +35,33 @@ public class BufferedTcpClient : IAsyncDisposable
 	/// <summary>
 	/// Initializes a new instance of the <see cref="BufferedTcpClient"/> class.
 	/// </summary>
+	/// <param name="clientID">The client ID (used in diagnostic messages).</param>
 	/// <param name="socket">The TCP socket that is read from/written to.</param>
 	/// <param name="receiveHandler">The handler that is called for each received line of text.</param>
+	/// <param name="diagnosticMessageSink">The message sink to send diagnostic messages to.</param>
 	public BufferedTcpClient(
+		string clientID,
 		Socket socket,
-		Action<ReadOnlyMemory<byte>> receiveHandler)
+		Action<ReadOnlyMemory<byte>> receiveHandler,
+		_IMessageSink? diagnosticMessageSink)
 	{
+		this.clientID = Guard.ArgumentNotNull(clientID);
 		this.socket = Guard.ArgumentNotNull(socket);
 		this.receiveHandler = Guard.ArgumentNotNull(receiveHandler);
+		this.diagnosticMessageSink = Guard.ArgumentNotNull(diagnosticMessageSink);
 	}
+
+	/// <summary>
+	/// Indicates that the connection has abnormally terminated, and it should be assumed that the remote
+	/// program has crashed or severely faulted.
+	/// </summary>
+	public Action<Exception>? OnAbnormalTermination;
 
 	/// <inheritdoc/>
 	public async ValueTask DisposeAsync()
 	{
 		if (disposed)
 			throw new ObjectDisposedException(typeof(BufferedTcpClient).FullName);
-
-		if (fault != null)
-		{
-			var tcs = new TaskCompletionSource<int>();
-			tcs.SetException(fault);
-			await tcs.Task;
-		}
 
 		disposed = true;
 
@@ -74,6 +84,13 @@ public class BufferedTcpClient : IAsyncDisposable
 		writeQueue.Enqueue(bytes);
 		writeEvent.Set();
 	}
+
+	/// <summary>
+	/// Encodes a string value as UTF8 bytes and sends those bytes to the other side of the connection.
+	/// </summary>
+	/// <param name="value">The value to send to the other side of the connection.</param>
+	public void Send(string value) =>
+		Send(Encoding.UTF8.GetBytes(value));
 
 	/// <summary>
 	/// Starts the read/write background workers.
@@ -121,13 +138,16 @@ public class BufferedTcpClient : IAsyncDisposable
 				if (result.IsCompleted)
 					break;
 			}
+
+			await reader.CompleteAsync();
 		}
 		catch (Exception ex)
 		{
-			fault = ex;
-		}
+			if (diagnosticMessageSink != null)
+				diagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"BufferTcpClient({clientID}): abnormal termination of pipe reader: {ex}" });
 
-		await reader.CompleteAsync();
+			OnAbnormalTermination?.Invoke(ex);
+		}
 	}
 
 	async Task StartSocketPipeWriter()
@@ -135,7 +155,7 @@ public class BufferedTcpClient : IAsyncDisposable
 		var stream = new NetworkStream(socket);
 		disposalTracker.Add(stream);
 
-		var writer = PipeWriter.Create(stream);
+		var pipeWriter = PipeWriter.Create(stream);
 
 		try
 		{
@@ -144,19 +164,21 @@ public class BufferedTcpClient : IAsyncDisposable
 				writeEvent.WaitOne();
 
 				while (writeQueue.TryDequeue(out var bytes))
-					await writer.WriteAsync(bytes);
+					await pipeWriter.WriteAsync(bytes);
+
+				await pipeWriter.FlushAsync();
 
 				if (finishedSource.Task.IsCompleted)
 					break;
 			}
+
+			await pipeWriter.CompleteAsync();
 		}
 		catch (Exception ex)
 		{
-			fault = ex;
+			if (diagnosticMessageSink != null)
+				diagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"BufferTcpClient({clientID}): abnormal termination of pipe writer: {ex}" });
 		}
-
-		await writer.CompleteAsync();
-		await writer.FlushAsync();
 	}
 
 	bool TryFindCommand(

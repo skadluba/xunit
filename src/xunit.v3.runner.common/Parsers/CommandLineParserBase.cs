@@ -176,6 +176,18 @@ public abstract class CommandLineParserBase
 		params string[] descriptions) =>
 			parsers[@switch] = (group, argumentDisplay, descriptions, handler);
 
+	/// <summary/>
+	protected void ChangeParserGroup(
+		string @switch,
+		CommandLineGroup group)
+	{
+		if (parsers.TryGetValue(@switch, out var parser))
+		{
+			parsers.Remove(@switch);
+			parsers.Add(@switch, (group, parser.ArgumentDisplay, parser.Descriptions, parser.Handler));
+		}
+	}
+
 	static void EnsurePathExists(string path)
 	{
 		var directory = Path.GetDirectoryName(path);
@@ -264,72 +276,6 @@ public abstract class CommandLineParserBase
 
 	/// <summary/>
 	protected abstract Assembly LoadAssembly(string dllFile);
-
-	/// <summary/>
-	protected XunitProject ParseInternal(int argStartIndex)
-	{
-		var arguments = new Stack<string>();
-		var unknownOptions = new List<string>();
-
-		for (var i = Args.Length - 1; i >= argStartIndex; i--)
-			arguments.Push(Args[i]);
-
-		while (arguments.Count > 0)
-		{
-			var option = PopOption(arguments);
-			var optionName = option.Key.ToLowerInvariant();
-
-			if (!optionName.StartsWith("-", StringComparison.Ordinal))
-				throw new ArgumentException($"unknown option: {option.Key}");
-
-			optionName = optionName.Substring(1);
-
-			if (parsers.TryGetValue(optionName, out var parser))
-				parser.Handler(option);
-			else
-			{
-				// Might be a result output file...
-				if (TransformFactory.AvailableTransforms.Any(t => t.ID.Equals(optionName, StringComparison.OrdinalIgnoreCase)))
-				{
-					if (option.Value == null)
-						throw new ArgumentException($"missing filename for {option.Key}");
-
-					EnsurePathExists(option.Value);
-
-					Project.Configuration.Output.Add(optionName, option.Value);
-				}
-				// ...or it might be a reporter (we won't know until later)
-				else
-				{
-					GuardNoOptionValue(option);
-					unknownOptions.Add(optionName);
-				}
-			}
-		}
-
-		// Determine the runner reporter while validating the unknown parsed options
-		runnerReporters ??= GetAvailableRunnerReporters();
-
-		var runnerReporter = default(IRunnerReporter);
-		var autoReporter =
-			Project.Configuration.NoAutoReportersOrDefault
-				? null
-				: runnerReporters.FirstOrDefault(r => r.IsEnvironmentallyEnabled);
-
-		foreach (var unknownOption in unknownOptions)
-		{
-			var reporter = runnerReporters.FirstOrDefault(r => r.RunnerSwitch == unknownOption) ?? throw new ArgumentException($"unknown option: -{unknownOption}");
-
-			if (runnerReporter != null)
-				throw new ArgumentException("only one reporter is allowed");
-
-			runnerReporter = reporter;
-		}
-
-		Project.RunnerReporter = autoReporter ?? runnerReporter ?? new DefaultRunnerReporter();
-
-		return Project;
-	}
 
 	void OnClass(KeyValuePair<string, string?> option)
 	{
@@ -612,6 +558,72 @@ public abstract class CommandLineParserBase
 		Project.Configuration.Wait = true;
 	}
 
+	/// <summary/>
+	protected XunitProject ParseInternal(int argStartIndex)
+	{
+		var arguments = new Stack<string>();
+		var unknownOptions = new List<string>();
+
+		for (var i = Args.Length - 1; i >= argStartIndex; i--)
+			arguments.Push(Args[i]);
+
+		while (arguments.Count > 0)
+		{
+			var option = PopOption(arguments);
+			var optionName = option.Key.ToLowerInvariant();
+
+			if (!optionName.StartsWith("-", StringComparison.Ordinal))
+				throw new ArgumentException($"unknown option: {option.Key}");
+
+			optionName = optionName.Substring(1);
+
+			if (parsers.TryGetValue(optionName, out var parser))
+				parser.Handler(option);
+			else
+			{
+				// Might be a result output file...
+				if (TransformFactory.AvailableTransforms.Any(t => t.ID.Equals(optionName, StringComparison.OrdinalIgnoreCase)))
+				{
+					if (option.Value == null)
+						throw new ArgumentException($"missing filename for {option.Key}");
+
+					EnsurePathExists(option.Value);
+
+					Project.Configuration.Output.Add(optionName, option.Value);
+				}
+				// ...or it might be a reporter (we won't know until later)
+				else
+				{
+					GuardNoOptionValue(option);
+					unknownOptions.Add(optionName);
+				}
+			}
+		}
+
+		// Determine the runner reporter while validating the unknown parsed options
+		runnerReporters ??= GetAvailableRunnerReporters();
+
+		var runnerReporter = default(IRunnerReporter);
+		var autoReporter =
+			Project.Configuration.NoAutoReportersOrDefault
+				? null
+				: runnerReporters.FirstOrDefault(r => r.IsEnvironmentallyEnabled);
+
+		foreach (var unknownOption in unknownOptions)
+		{
+			var reporter = runnerReporters.FirstOrDefault(r => r.RunnerSwitch == unknownOption) ?? throw new ArgumentException($"unknown option: -{unknownOption}");
+
+			if (runnerReporter != null)
+				throw new ArgumentException("only one reporter is allowed");
+
+			runnerReporter = reporter;
+		}
+
+		Project.RunnerReporter = autoReporter ?? runnerReporter ?? new DefaultRunnerReporter();
+
+		return Project;
+	}
+
 	static KeyValuePair<string, string?> PopOption(Stack<string> arguments)
 	{
 		var option = arguments.Pop();
@@ -626,14 +638,17 @@ public abstract class CommandLineParserBase
 	/// <summary/>
 	public void PrintUsage()
 	{
+		var hasTcpSwitch = parsers.ContainsKey("tcp");
+
 		PrintUsageGroup(CommandLineGroup.General, "General options");
+		PrintUsageGroup(CommandLineGroup.Interactive, "Interactive options (not valid with -tcp)");
 		PrintUsageGroup(CommandLineGroup.NetFramework, "Options for .NET Framework projects (v1 or v2 only)");
 		PrintUsageGroup(CommandLineGroup.Filter, "Filtering (optional, choose one or more)", "If more than one filter type is specified, cross-filter type filters act as an AND operation");
 
 		if (RunnerReporters.Count > 0)
 		{
 			Console.WriteLine();
-			Console.WriteLine("Reporters (optional, choose only one)");
+			Console.WriteLine($"Reporters (optional, choose only one{(hasTcpSwitch ? "; not valid with -tcp" : "")})");
 			Console.WriteLine();
 
 			var longestSwitch = RunnerReporters.Max(r => r.RunnerSwitch?.Length ?? 0);
@@ -648,7 +663,7 @@ public abstract class CommandLineParserBase
 		if (TransformFactory.AvailableTransforms.Count != 0)
 		{
 			Console.WriteLine();
-			Console.WriteLine("Result formats (optional, choose one or more)");
+			Console.WriteLine($"Result formats (optional, choose one or more{(hasTcpSwitch ? "; not valid with -tcp" : "")})");
 			Console.WriteLine();
 
 			var longestTransform = TransformFactory.AvailableTransforms.Max(t => t.ID.Length);
