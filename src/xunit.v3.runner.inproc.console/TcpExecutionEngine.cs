@@ -36,15 +36,11 @@ public class TcpExecutionEngine : TcpEngine
 	/// </summary>
 	/// <param name="engineID">Engine ID (used for diagnostic messages).</param>
 	/// <param name="project">The test project.</param>
-	/// <param name="diagnosticMessageSink">The message sink to send diagnostic messages to.</param>
 	public TcpExecutionEngine(
 		string engineID,
-		XunitProject project,
-		_IMessageSink? diagnosticMessageSink) :
-			base(engineID, diagnosticMessageSink)
+		XunitProject project) :
+			base(engineID)
 	{
-		State = TcpEngineState.Initialized;
-
 		AddCommandHandler(TcpEngineMessages.Runner.Cancel, OnCancel);
 		AddCommandHandler(TcpEngineMessages.Runner.Find, OnFind);
 		AddCommandHandler(TcpEngineMessages.Runner.Info, OnInfo);
@@ -65,12 +61,13 @@ public class TcpExecutionEngine : TcpEngine
 		DisposalTracker.Add(testFramework);
 
 		socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
-		bufferedClient = new BufferedTcpClient($"execution::{engineID}", socket, ProcessRequest, diagnosticMessageSink);
+		bufferedClient = new BufferedTcpClient($"execution::{engineID}", socket, ProcessRequest, this);
+
+		State = TcpEngineState.Initialized;
 
 		DisposalTracker.AddAsyncAction(async () =>
 		{
-			if (DiagnosticMessageSink != null)
-				DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): Disconnecting from tcp://localhost:{port}/" });
+			SendInternalDiagnosticMessage("{0} [INF] Disconnecting from tcp://localhost:{1}/", MessagePrefix, port);
 
 			try
 			{
@@ -78,8 +75,7 @@ public class TcpExecutionEngine : TcpEngine
 			}
 			catch (Exception ex)
 			{
-				if (DiagnosticMessageSink != null)
-					DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): Error during buffered client disposal: {ex}" });
+				SendInternalDiagnosticMessage("{0} [ERR] Error during buffered client disposal: {1}", MessagePrefix, ex);
 			}
 
 			try
@@ -91,12 +87,10 @@ public class TcpExecutionEngine : TcpEngine
 			}
 			catch (Exception ex)
 			{
-				if (DiagnosticMessageSink != null)
-					DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): Error during connection socket shutdown: {ex}" });
+				SendInternalDiagnosticMessage("{0} [ERR] Error during connection socket shutdown: {1}", MessagePrefix, ex);
 			}
 
-			if (DiagnosticMessageSink != null)
-				DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): Disconnected from tcp://localhost:{port}/" });
+			SendInternalDiagnosticMessage("{0} [INF] Disconnected from tcp://localhost:{1}/", MessagePrefix, port);
 		});
 	}
 
@@ -106,17 +100,14 @@ public class TcpExecutionEngine : TcpEngine
 		{
 			executingOperations.Add(operationID);
 
-			if (DiagnosticMessageSink != null)
-				DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): RUN started for operation ID '{operationID}'" });
+			SendInternalDiagnosticMessage("{0} [INF] RUN started for operation ID '{1}'", MessagePrefix, operationID);
 
 			try
 			{
 				var discoveryOptions = _TestFrameworkOptions.ForDiscovery(projectAssembly.Configuration);
 				var executionOptions = _TestFrameworkOptions.ForExecution(projectAssembly.Configuration);
-
-				var cancel = false;  // Who sets this?
 				var frontController = new InProcessFrontController(testFramework, assemblyInfo, projectAssembly.ConfigFileName);
-				var callbackSink = new EngineExecutionSink(this, operationID);
+				var callbackSink = new EngineCallbackSink(this, operationID);
 				IExecutionSink resultsSink = new DelegatingSummarySink(
 					projectAssembly,
 					discoveryOptions,
@@ -124,11 +115,11 @@ public class TcpExecutionEngine : TcpEngine
 					AppDomainOption.NotAvailable,
 					shadowCopy: false,
 					callbackSink,
-					() => cancel
+					() => !cancellationRequested.Contains(operationID)
 				);
 				var longRunningSeconds = projectAssembly.Configuration.LongRunningTestSecondsOrDefault;
-				if (longRunningSeconds > 0 && DiagnosticMessageSink != null)
-					resultsSink = new DelegatingLongRunningTestDetectionSink(resultsSink, TimeSpan.FromSeconds(longRunningSeconds), DiagnosticMessageSink);
+				if (longRunningSeconds > 0)
+					resultsSink = new DelegatingLongRunningTestDetectionSink(resultsSink, TimeSpan.FromSeconds(longRunningSeconds), this);
 				if (projectAssembly.Configuration.FailSkipsOrDefault)
 					resultsSink = new DelegatingFailSkipSink(resultsSink);
 
@@ -138,8 +129,7 @@ public class TcpExecutionEngine : TcpEngine
 
 					if (projectAssembly.Configuration.StopOnFailOrDefault && resultsSink.ExecutionSummary.Failed != 0)
 					{
-						if (DiagnosticMessageSink != null)
-							DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): Cancelling all operations because operation ID '{operationID}' ended in failure" });
+						SendInternalDiagnosticMessage("{0} [WRN] Cancelling all operations because operation ID '{1}' ended in failure", MessagePrefix, operationID);
 
 						foreach (var executingOperation in executingOperations)
 							cancellationRequested.Add(executingOperation);
@@ -155,8 +145,7 @@ public class TcpExecutionEngine : TcpEngine
 			executingOperations.Remove(operationID);
 			cancellationRequested.Remove(operationID);
 
-			if (DiagnosticMessageSink != null)
-				DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): RUN finished for operation ID '{operationID}'" });
+			SendInternalDiagnosticMessage("{0} [INF] RUN finished for operation ID '{1}'", MessagePrefix, operationID);
 		});
 	}
 
@@ -166,15 +155,46 @@ public class TcpExecutionEngine : TcpEngine
 		{
 			executingOperations.Add(operationID);
 
-			if (DiagnosticMessageSink != null)
-				DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): FIND started for operation ID '{operationID}'" });
+			SendInternalDiagnosticMessage("{0} [INF] FIND started for operation ID '{1}'", MessagePrefix, operationID);
 
 			try
 			{
 				var discoveryOptions = _TestFrameworkOptions.ForDiscovery(projectAssembly.Configuration);
-				var testDiscoverer = testFramework.GetDiscoverer(assemblyInfo);
-				var filterer = new EngineDiscoveryFilterer(this, testDiscoverer.TestAssembly.UniqueID, operationID, projectAssembly.Configuration.Filters.Filter);
-				await testDiscoverer.Find(filterer.OnTestCaseDiscovered, discoveryOptions);
+				var frontController = new InProcessFrontController(testFramework, assemblyInfo, projectAssembly.ConfigFileName);
+				var callbackSink = new EngineCallbackSink(this, operationID);
+
+				await frontController.Find(
+					callbackSink,
+					discoveryOptions,
+					projectAssembly.Configuration.Filters.Filter,
+					discoveryCallback: (testCase, passedFilter) =>
+					{
+						if (passedFilter)
+						{
+							var testCaseDiscovered = new _TestCaseDiscovered
+							{
+								AssemblyUniqueID = frontController.TestAssemblyUniqueID,
+								Serialization = "" /*SerializationHelper.Serialize(testCase)*/,
+								SkipReason = testCase.SkipReason,
+								SourceFilePath = testCase.SourceFilePath,
+								SourceLineNumber = testCase.SourceLineNumber,
+								TestCaseDisplayName = testCase.TestCaseDisplayName,
+								TestCaseUniqueID = testCase.UniqueID,
+								TestClassName = testCase.TestClassName,
+								TestClassNamespace = testCase.TestClassNamespace,
+								TestClassNameWithNamespace = testCase.TestClassNameWithNamespace,
+								TestClassUniqueID = testCase.TestMethod?.TestClass.UniqueID,
+								TestCollectionUniqueID = testCase.TestCollection.UniqueID,
+								TestMethodName = testCase.TestMethodName,
+								TestMethodUniqueID = testCase.TestMethod?.UniqueID,
+								Traits = testCase.Traits
+							};
+
+							SendMessage(operationID, testCaseDiscovered);
+						}
+
+						return new(!cancellationRequested.Contains(operationID));
+					});
 			}
 			catch (Exception ex)
 			{
@@ -185,8 +205,7 @@ public class TcpExecutionEngine : TcpEngine
 			executingOperations.Remove(operationID);
 			cancellationRequested.Remove(operationID);
 
-			if (DiagnosticMessageSink != null)
-				DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): FIND finished for operation ID '{operationID}'" });
+			SendInternalDiagnosticMessage("{0} [INF] FIND finished for operation ID '{1}'", MessagePrefix, operationID);
 		});
 	}
 
@@ -196,33 +215,25 @@ public class TcpExecutionEngine : TcpEngine
 		{
 			if (State != TcpEngineState.Connected)
 			{
-				if (DiagnosticMessageSink != null)
-					DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"{nameof(TcpExecutionEngine)}({EngineID}): Ignoring CANCEL message received outside of {TcpEngineState.Connected} state (current state is {State})" });
-
+				SendInternalDiagnosticMessage("{0} [ERR] Ignoring CANCEL message received outside of {1} state (current state is {2})", MessagePrefix, TcpEngineState.Connecting, State);
 				return;
 			}
 		}
 
 		if (!data.HasValue || data.Value.Length == 0)
 		{
-			if (DiagnosticMessageSink != null)
-				DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): CANCEL data is missing the operation ID" });
-
+			SendInternalDiagnosticMessage("{0} [ERR] CANCEL data is missing the operation ID", MessagePrefix);
 			return;
 		}
 
 		var operationID = Encoding.UTF8.GetString(data.Value.ToArray());
 		if (!executingOperations.Contains(operationID))
 		{
-			if (DiagnosticMessageSink != null)
-				DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): CANCEL requested for unknown operation ID '{operationID}'" });
-
+			SendInternalDiagnosticMessage("{0} [ERR] CANCEL requested for unknown operation ID '{1}'", MessagePrefix, operationID);
 			return;
 		}
 
-		if (DiagnosticMessageSink != null)
-			DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): CANCEL request recorded for operation ID '{operationID}'" });
-
+		SendInternalDiagnosticMessage("{0} [INF] CANCEL request recorded for operation ID '{1}'", MessagePrefix, operationID);
 		cancellationRequested.Add(operationID);
 	}
 
@@ -232,27 +243,21 @@ public class TcpExecutionEngine : TcpEngine
 		{
 			if (State != TcpEngineState.Connected)
 			{
-				if (DiagnosticMessageSink != null)
-					DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"{nameof(TcpExecutionEngine)}({EngineID}): Ignoring FIND message received outside of {TcpEngineState.Connected} state (current state is {State})" });
-
+				SendInternalDiagnosticMessage("{0} [ERR] Ignoring FIND message received outside of {1} state (current state is {2})", MessagePrefix, TcpEngineState.Connected, State);
 				return;
 			}
 		}
 
 		if (!data.HasValue || data.Value.Length == 0)
 		{
-			if (DiagnosticMessageSink != null)
-				DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): FIND data is missing the operation ID" });
-
+			SendInternalDiagnosticMessage("{0} [ERR] FIND data is missing the operation ID", MessagePrefix);
 			return;
 		}
 
 		var operationID = Encoding.UTF8.GetString(data.Value.ToArray());
 		if (executingOperations.Contains(operationID))
 		{
-			if (DiagnosticMessageSink != null)
-				DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): FIND requested for duplicate operation ID '{operationID}'" });
-
+			SendInternalDiagnosticMessage("{0} [ERR] FIND requested for duplicate operation ID '{1}'", MessagePrefix, operationID);
 			return;
 		}
 
@@ -264,10 +269,7 @@ public class TcpExecutionEngine : TcpEngine
 		lock (StateLock)
 		{
 			if (State != TcpEngineState.Negotiating)
-			{
-				if (DiagnosticMessageSink != null)
-					DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"{nameof(TcpExecutionEngine)}({EngineID}): INFO message received outside of {TcpEngineState.Negotiating} state (current state is {State})" });
-			}
+				SendInternalDiagnosticMessage("{0} [ERR] INFO message received outside of {1} state (current state is {2})", MessagePrefix, TcpEngineState.Negotiating, State);
 			else
 				State = TcpEngineState.Connected;
 		}
@@ -294,31 +296,47 @@ public class TcpExecutionEngine : TcpEngine
 		{
 			if (State != TcpEngineState.Connected)
 			{
-				if (DiagnosticMessageSink != null)
-					DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"{nameof(TcpExecutionEngine)}({EngineID}): Ignoring RUN message received outside of {TcpEngineState.Connected} state (current state is {State})" });
-
+				SendInternalDiagnosticMessage("{0} [ERR] Ignoring RUN message received outside of {1} state (current state is {2})", MessagePrefix, TcpEngineState.Connected, State);
 				return;
 			}
 		}
 
 		if (!data.HasValue || data.Value.Length == 0)
 		{
-			if (DiagnosticMessageSink != null)
-				DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): RUN data is missing the operation ID" });
-
+			SendInternalDiagnosticMessage("{0} [ERR] RUN data is missing the operation ID", MessagePrefix);
 			return;
 		}
 
 		var operationID = Encoding.UTF8.GetString(data.Value.ToArray());
 		if (executingOperations.Contains(operationID))
 		{
-			if (DiagnosticMessageSink != null)
-				DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): RUN requested for duplicate operation ID '{operationID}'" });
-
+			SendInternalDiagnosticMessage("{0}: [ERR] RUN requested for duplicate operation ID '{1}'", MessagePrefix, operationID);
 			return;
 		}
 
 		_ = Execute(operationID);
+	}
+
+	/// <inheritdoc/>
+	protected override void SendDiagnosticMessage(
+		string format,
+		params object[] args)
+	{
+		var msg = new _DiagnosticMessage { Message = string.Format(format, args) };
+
+		SendMessage(BroadcastOperationID, msg);
+		TestContext.Current?.DiagnosticMessageSink?.OnMessage(msg);
+	}
+
+	/// <inheritdoc/>
+	protected override void SendInternalDiagnosticMessage(
+		string format,
+		params object[] args)
+	{
+		var msg = new _InternalDiagnosticMessage { Message = string.Format(format, args) };
+
+		SendMessage(BroadcastOperationID, msg);
+		TestContext.Current?.InternalDiagnosticMessageSink?.OnMessage(msg);
 	}
 
 	/// <summary>
@@ -333,13 +351,17 @@ public class TcpExecutionEngine : TcpEngine
 	{
 		Guard.ArgumentNotNull(operationID);
 		Guard.ArgumentNotNull(message);
+		Guard.NotNull("Tried to call SendMessage when there is no remote engine available yet", bufferedClient);
 
-		bufferedClient.Send(TcpEngineMessages.Execution.Message);
-		bufferedClient.Send(TcpEngineMessages.Separator);
-		bufferedClient.Send(operationID);
-		bufferedClient.Send(TcpEngineMessages.Separator);
-		bufferedClient.Send(message.ToJson());
-		bufferedClient.Send(TcpEngineMessages.EndOfMessage);
+		if (!bufferedClient.Disposed)
+		{
+			bufferedClient.Send(TcpEngineMessages.Execution.Message);
+			bufferedClient.Send(TcpEngineMessages.Separator);
+			bufferedClient.Send(operationID);
+			bufferedClient.Send(TcpEngineMessages.Separator);
+			bufferedClient.Send(message.ToJson());
+			bufferedClient.Send(TcpEngineMessages.EndOfMessage);
+		}
 
 		return !cancellationRequested.Contains(operationID);
 	}
@@ -359,13 +381,11 @@ public class TcpExecutionEngine : TcpEngine
 			State = TcpEngineState.Connecting;
 		}
 
-		if (DiagnosticMessageSink != null)
-			DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): Connecting to tcp://localhost:{port}/" });
+		SendInternalDiagnosticMessage("{0} [INF] Connecting to tcp://localhost:{1}/", MessagePrefix, port);
 
 		await socket.ConnectAsync(IPAddress.Loopback, port);
 
-		if (DiagnosticMessageSink != null)
-			DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"TcpExecutionEngine({EngineID}): Connected to tcp://localhost:{port}/" });
+		SendInternalDiagnosticMessage("{0} [INF] Connected to tcp://localhost:{1}/", MessagePrefix, port);
 
 		lock (StateLock)
 			State = TcpEngineState.Negotiating;
@@ -382,61 +402,12 @@ public class TcpExecutionEngine : TcpEngine
 	public Task WaitForQuit() =>
 		shutdownRequested.Task;
 
-	class EngineDiscoveryFilterer
-	{
-		readonly TcpExecutionEngine engine;
-		readonly Func<_ITestCaseMetadata, bool> filter;
-		readonly string operationID;
-		readonly string testAssemblyUniqueID;
-
-		public EngineDiscoveryFilterer(
-			TcpExecutionEngine engine,
-			string testAssemblyUniqueID,
-			string operationID,
-			Func<_ITestCaseMetadata, bool> filter)
-		{
-			this.engine = engine;
-			this.testAssemblyUniqueID = testAssemblyUniqueID;
-			this.operationID = operationID;
-			this.filter = filter;
-		}
-
-		public ValueTask<bool> OnTestCaseDiscovered(_ITestCase testCase)
-		{
-			if (filter(testCase))
-			{
-				var testCaseDiscovered = new _TestCaseDiscovered
-				{
-					AssemblyUniqueID = testAssemblyUniqueID,
-					Serialization = "TBD"/*await Serialize(testCase)*/,
-					SkipReason = testCase.SkipReason,
-					SourceFilePath = testCase.SourceFilePath,
-					SourceLineNumber = testCase.SourceLineNumber,
-					TestCaseDisplayName = testCase.TestCaseDisplayName,
-					TestCaseUniqueID = testCase.UniqueID,
-					TestClassName = testCase.TestClassName,
-					TestClassNamespace = testCase.TestClassNamespace,
-					TestClassNameWithNamespace = testCase.TestClassNameWithNamespace,
-					TestClassUniqueID = testCase.TestMethod?.TestClass.UniqueID,
-					TestCollectionUniqueID = testCase.TestCollection.UniqueID,
-					TestMethodName = testCase.TestMethodName,
-					TestMethodUniqueID = testCase.TestMethod?.UniqueID,
-					Traits = testCase.Traits
-				};
-
-				engine.SendMessage(operationID, testCaseDiscovered);
-			}
-
-			return new(!engine.cancellationRequested.Contains(operationID));
-		}
-	}
-
-	class EngineExecutionSink : _IMessageSink
+	class EngineCallbackSink : _IMessageSink
 	{
 		readonly TcpExecutionEngine engine;
 		readonly string operationID;
 
-		public EngineExecutionSink(
+		public EngineCallbackSink(
 			TcpExecutionEngine engine,
 			string operationID)
 		{

@@ -42,7 +42,8 @@ public class Xunit3 : IFrontController
 		Guard.NotNull($"{typeof(Xunit3).FullName} does not yet support dynamic assemblies", projectAssembly.AssemblyFileName);
 		Guard.ArgumentValid("xUnit.net v3 tests do not support app domains", projectAssembly.Configuration.AppDomainOrDefault != AppDomainSupport.Required, nameof(projectAssembly));
 
-		runnerEngine = new TcpRunnerEngine("tbd", OnMessage, diagnosticMessageSink);
+		// TODO: Is assembly display name here descriptive/unique enough as an ID?
+		runnerEngine = new TcpRunnerEngine(projectAssembly.AssemblyDisplayName, OnMessage, diagnosticMessageSink);
 		disposalTracker.Add(runnerEngine);
 
 		var port = runnerEngine.Start();
@@ -128,7 +129,19 @@ public class Xunit3 : IFrontController
 
 	bool OnMessage(string operationID, _MessageSinkMessage message)
 	{
-		if (operationID == "::BROADCAST::")
+		if (message is _DiagnosticMessage diagnosticMessage)
+		{
+			diagnosticMessageSink.OnMessage(diagnosticMessage);
+			return true;
+		}
+
+		if (message is _InternalDiagnosticMessage internalDiagnosticMessage)
+		{
+			diagnosticMessageSink.OnMessage(internalDiagnosticMessage);
+			return true;
+		}
+
+		if (operationID == TcpEngine.BroadcastOperationID)
 		{
 			foreach (var operationSink in operations.Values)
 				operationSink.OnMessage(message);

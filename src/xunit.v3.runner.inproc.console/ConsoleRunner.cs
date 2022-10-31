@@ -126,10 +126,13 @@ public class ConsoleRunner
 			var globalDiagnosticMessageSink = ConsoleDiagnosticMessageSink.TryCreate(consoleLock, noColor, globalDiagnosticMessages, globalInternalDiagnosticMessages);
 			var shouldReturnFailErrorCode = false;
 
+			TestContext.SetForInitialization(globalDiagnosticMessageSink, globalDiagnosticMessages, globalInternalDiagnosticMessages);
+
 			if (project.Configuration.TcpPort.HasValue)
 			{
+				// TODO: Is assembly display name here descriptive/unique enough as an ID?
 				var engineID = Path.GetFileNameWithoutExtension(Assembly.GetEntryAssembly()?.Location) ?? "<unknown assembly>";
-				await using var engine = new TcpExecutionEngine(engineID, project, globalDiagnosticMessageSink);
+				await using var engine = new TcpExecutionEngine(engineID, project);
 				await engine.Start();
 				await engine.WaitForQuit();
 			}
@@ -237,8 +240,6 @@ public class ConsoleRunner
 			var internalDiagnosticMessages = assembly.Configuration.InternalDiagnosticMessagesOrDefault;
 			var diagnosticMessageSink = ConsoleDiagnosticMessageSink.TryCreate(consoleLock, noColor, diagnosticMessages, internalDiagnosticMessages);
 
-			TestContext.SetForInitialization(diagnosticMessageSink, diagnosticMessages, internalDiagnosticMessages);
-
 			var assemblyInfo = new ReflectionAssemblyInfo(testAssembly);
 
 			await using var disposalTracker = new DisposalTracker();
@@ -323,8 +324,6 @@ public class ConsoleRunner
 			var internalDiagnosticMessages = assembly.Configuration.InternalDiagnosticMessagesOrDefault;
 			var diagnosticMessageSink = ConsoleDiagnosticMessageSink.TryCreate(consoleLock, noColor, diagnosticMessages, internalDiagnosticMessages);
 			var longRunningSeconds = assembly.Configuration.LongRunningTestSecondsOrDefault;
-
-			TestContext.SetForInitialization(diagnosticMessageSink, diagnosticMessages, internalDiagnosticMessages);
 
 			var assemblyInfo = new ReflectionAssemblyInfo(testAssembly);
 

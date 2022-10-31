@@ -23,7 +23,6 @@ public class BufferedTcpClient : IAsyncDisposable
 {
 	readonly string clientID;
 	readonly _IMessageSink? diagnosticMessageSink;
-	bool disposed = false;
 	readonly DisposalTracker disposalTracker = new();
 	readonly TaskCompletionSource<int> finishedSource = new();
 	readonly Action<ReadOnlyMemory<byte>> receiveHandler;
@@ -57,13 +56,18 @@ public class BufferedTcpClient : IAsyncDisposable
 	/// </summary>
 	public Action<Exception>? OnAbnormalTermination;
 
+	/// <summary>
+	/// Gets a flag indicating whether this client has already been disposed.
+	/// </summary>
+	public bool Disposed { get; private set; }
+
 	/// <inheritdoc/>
 	public async ValueTask DisposeAsync()
 	{
-		if (disposed)
+		if (Disposed)
 			throw new ObjectDisposedException(typeof(BufferedTcpClient).FullName);
 
-		disposed = true;
+		Disposed = true;
 
 		finishedSource.TrySetResult(0);
 		writeEvent.Set();
@@ -78,7 +82,7 @@ public class BufferedTcpClient : IAsyncDisposable
 	/// <param name="bytes">The bytes to send to the other side of the connection.</param>
 	public void Send(byte[] bytes)
 	{
-		if (disposed)
+		if (Disposed)
 			throw new ObjectDisposedException(typeof(BufferedTcpClient).FullName);
 
 		writeQueue.Enqueue(bytes);

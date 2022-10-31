@@ -12,8 +12,14 @@ namespace Xunit.Runner.v3;
 /// A base class used for TCP engines (specifically, <see cref="TcpRunnerEngine"/> and
 /// <see cref="T:Xunit.Runner.v3.TcpExecutionEngine"/>).
 /// </summary>
-public class TcpEngine : IAsyncDisposable
+public abstract class TcpEngine : IAsyncDisposable, _IMessageSink
 {
+	/// <summary>
+	/// Gets the operation ID that is used for broadcast messages (messages which are not associated with any specific
+	/// operation ID, especially diagnostic/internal diagnostic messages).
+	/// </summary>
+	public const string BroadcastOperationID = "::BROADCAST::";
+
 	readonly List<(byte[] command, Action<ReadOnlyMemory<byte>?> handler)> commandHandlers = new();
 	TcpEngineState state = TcpEngineState.Unknown;
 
@@ -21,19 +27,12 @@ public class TcpEngine : IAsyncDisposable
 	/// Initializes a new instance of the <see cref="TcpEngine"/> class.
 	/// </summary>
 	/// <param name="engineID">The engine ID (used for diagnostic messages).</param>
-	/// <param name="diagnosticMessageSink">The diagnostic message sink to send diagnostic messages to.</param>
 	public TcpEngine(
-		string engineID,
-		_IMessageSink? diagnosticMessageSink)
+		string engineID)
 	{
 		EngineID = Guard.ArgumentNotNullOrEmpty(engineID);
-		DiagnosticMessageSink = diagnosticMessageSink;
+		MessagePrefix = $"{GetType().Name}({EngineID}):";
 	}
-
-	/// <summary>
-	/// Gets the diagnostic message sink to send diagnostic messages to.
-	/// </summary>
-	protected _IMessageSink? DiagnosticMessageSink { get; }
 
 	/// <summary>
 	/// Gets the disposal tracker that's automatically cleaned up during <see cref="DisposeAsync"/>.
@@ -46,6 +45,11 @@ public class TcpEngine : IAsyncDisposable
 	protected string EngineID { get; }
 
 	/// <summary>
+	/// Gets the message prefix to be used when sending diagnostic and internal diagnostic messages.
+	/// </summary>
+	protected string MessagePrefix { get; }
+
+	/// <summary>
 	/// Gets the current state of the engine.
 	/// </summary>
 	public TcpEngineState State
@@ -54,9 +58,7 @@ public class TcpEngine : IAsyncDisposable
 		protected set
 		{
 			// TODO: Should we offer an event for state changes?
-			if (DiagnosticMessageSink != null)
-				DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"{GetType().Name}({EngineID}): Engine state transition from {state} to {value}" });
-
+			SendInternalDiagnosticMessage("{0} [INF] Engine state transition from {1} to {2}", MessagePrefix, state, value);
 			state = value;
 		}
 	}
@@ -80,7 +82,7 @@ public class TcpEngine : IAsyncDisposable
 		lock (StateLock)
 		{
 			if (State == TcpEngineState.Disconnecting || State == TcpEngineState.Disconnected)
-				throw new ObjectDisposedException($"{GetType().Name}({EngineID})");
+				throw new ObjectDisposedException(MessagePrefix);
 
 			State = TcpEngineState.Disconnecting;
 		}
@@ -91,12 +93,23 @@ public class TcpEngine : IAsyncDisposable
 		}
 		catch (Exception ex)
 		{
-			if (DiagnosticMessageSink != null)
-				DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"{GetType().Name}({EngineID}): Error during disposal: {ex}" });
+			SendInternalDiagnosticMessage("{0} [ERR] Error during disposal: {1}", MessagePrefix, ex);
 		}
 
 		lock (StateLock)
 			State = TcpEngineState.Disconnected;
+	}
+
+	// This allows this type to be used as a diagnostic message sink, which then converts the messages it receives
+	// into calls to SendXxx.
+	bool _IMessageSink.OnMessage(_MessageSinkMessage message)
+	{
+		if (message is _DiagnosticMessage diagnosticMessage)
+			SendDiagnosticMessage("{0}", diagnosticMessage.Message);
+		else if (message is _InternalDiagnosticMessage internalDiagnosticMessage)
+			SendInternalDiagnosticMessage("{0}", internalDiagnosticMessage.Message);
+
+		return true;
 	}
 
 	/// <summary>
@@ -117,14 +130,28 @@ public class TcpEngine : IAsyncDisposable
 				}
 				catch (Exception ex)
 				{
-					if (DiagnosticMessageSink != null)
-						DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"{GetType().Name}({EngineID}): Error during message processing '{Encoding.UTF8.GetString(request.ToArray())}': {ex}" });
+					SendInternalDiagnosticMessage("{0} [ERR] Error during message processing '{1}': {2}", MessagePrefix, Encoding.UTF8.GetString(request.ToArray()), ex);
 				}
 
 				return;
 			}
 
-		if (DiagnosticMessageSink != null)
-			DiagnosticMessageSink.OnMessage(new _DiagnosticMessage { Message = $"{GetType().Name}({EngineID}): Received unknown command '{Encoding.UTF8.GetString(request.ToArray())}'" });
+		SendInternalDiagnosticMessage("{0} [ERR] Received unknown command '{1}'", MessagePrefix, Encoding.UTF8.GetString(request.ToArray()));
 	}
+
+	/// <summary>
+	/// Sends a diagnostic message (typically an instance of <see cref="_DiagnosticMessage"/>) to either a local listener and/or
+	/// a remote-side engine.
+	/// </summary>
+	protected abstract void SendDiagnosticMessage(
+		string format,
+		params object[] args);
+
+	/// <summary>
+	/// Sends am internal diagnostic message (typically an instance of <see cref="_InternalDiagnosticMessage"/>) to either a local
+	/// listener and/or a remote-side engine.
+	/// </summary>
+	protected abstract void SendInternalDiagnosticMessage(
+		string format,
+		params object[] args);
 }
